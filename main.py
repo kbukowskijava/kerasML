@@ -14,7 +14,8 @@
 #             Given in three different formats: CSV, XLSX and JSON.
 ###################################################################
 
-
+import os
+import datetime
 import tensorflow as tf
 from tensorflow import keras
 import numpy as np
@@ -24,14 +25,40 @@ import json
 import windowGenerator as wg
 import logging
 from sklearn.preprocessing import MinMaxScaler
+import seaborn as sns
+import math
 
 plt.style.use('fivethirtyeight')
 plt.rcParams['font.size'] = 8
 json_file_path = "config.json"  # ścieżka do pliku konfiguracyjnego
 
+MAX_EPOCHS = 20
+
+
+def compile_and_fit(model, window, patience=2):
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
+                                                      patience=patience,
+                                                      mode='min')
+
+    model.compile(loss=tf.losses.MeanSquaredError(),
+                  optimizer=tf.optimizers.Adam(),
+                  metrics=[tf.metrics.MeanAbsoluteError()])
+
+    history = model.fit(window.train, epochs=MAX_EPOCHS,
+                        validation_data=window.val,
+                        callbacks=[early_stopping])
+    return history
+
+
 # załadowanie pliku JSON do dict'a config
 with open(json_file_path) as json_file:
     config = json.load(json_file)
+
+
+def print_versions():
+    print(tf.__version__)
+    print(tf.keras.__version__)
+    print(pd.__version__)
 
 
 def read_csv(csvFilePath):
@@ -45,8 +72,9 @@ def show_tpr_graphs(dataFrame):
         plot_features = dataFrame[plot_cols]
         plot_features.index = dataFrame['Date Time']
         _ = plot_features.plot(subplots=True)
-        plot_features = dataFrame[plot_cols][:480]
-        plot_features.index = dataFrame['Date Time'][:480]
+        # wyrysowanie wykresu dla ostatnich 288 (48h) przypadków - dane są pobierane co 10 minut
+        plot_features = dataFrame[plot_cols][:288]
+        plot_features.index = dataFrame['Date Time'][:288]
         _ = plot_features.plot(subplots=True)
         plt.show()
         logging.info("Wykresy wygenerowane poprawnie!")
@@ -55,6 +83,7 @@ def show_tpr_graphs(dataFrame):
 
 
 def main():
+    print_versions()
     # odczytanie danych do trenowania z pliku CSV
     logging.info("odczytanie danych do trenowania z pliku CSV")
     train_df = read_csv("weather.csv")
@@ -64,8 +93,7 @@ def main():
     logging.info("odfiltrowanie najważniejszych kolumn")
     filterArray = ['Date Time', 'p (mbar)', 'T (degC)', 'rh (%)', 'VPmax (mbar)']
     train_df = train_df.filter(items=filterArray)
-    train_df['Date Time'] = pd.to_datetime(train_df['Date Time'])
-    print(train_df.dtypes)
+    train_df['Date Time'] = pd.to_datetime(train_df.pop('Date Time'), format='%d.%m.%Y %H:%M:%S')
     logging.info(
         f"Załadowano dane z plik CSV.\n Dataframe head:\n{train_df.head(config['amountOfHeadRows'])}\nSprawdzenie poprawności filtrowania...")
 
@@ -77,8 +105,79 @@ def main():
 
     show_tpr_graphs(train_df)
 
-    # zadaniem nominalnym tego zbioru jest przewidzenie temperatury
+    # zadaniem nominalnym tego zbioru jest przewidzenie temperatury na określony przez użytkownika okres
     # zatem niezbędne będzie oddzielenie cech od etykiet
+
+    filterArray = ['Date Time', 'T (degC)']
+    data_to_train = train_df.filter(items=filterArray)
+    timestamps_for_data_training = data_to_train['Date Time'].map(pd.Timestamp.timestamp)
+    data_to_train.head()
+
+    # jako dane pogodowe, mają wyraźną dzienną i roczną okresowość
+    # można uzyskać użyteczne sygnały, używając przekształceń sinus i cosinus, aby wyczyścić sygnały „Pora dnia” i „Pora roku”
+    day = 24 * 60 * 60
+    year = (365.2425) * day
+
+    data_to_train['Day sin'] = np.sin(timestamps_for_data_training * (2 * np.pi / day))
+    data_to_train['Day cos'] = np.cos(timestamps_for_data_training * (2 * np.pi / day))
+    data_to_train['Year sin'] = np.sin(timestamps_for_data_training * (2 * np.pi / year))
+    data_to_train['Year cos'] = np.cos(timestamps_for_data_training * (2 * np.pi / year))
+
+    plt.plot(np.array(data_to_train['Day sin'])[:228])
+    plt.plot(np.array(data_to_train['Day cos'])[:228])
+    plt.xlabel('Time [h]')
+    plt.title('Time of day signal')
+    plt.show()
+
+    # transformacja fouriera
+    fft = tf.signal.rfft(data_to_train['T (degC)'])
+    f_per_dataset = np.arange(0, len(fft))
+
+    n_samples_h = len(data_to_train['T (degC)'])
+    hours_per_year = 24 * 365.2524
+    years_per_dataset = n_samples_h / (hours_per_year)
+
+    f_per_year = f_per_dataset / years_per_dataset
+    plt.step(f_per_year, np.abs(fft))
+    plt.xscale('log')
+    plt.ylim(0, 400000)
+    plt.xlim([0.1, max(plt.xlim())])
+    plt.xticks([1, 365.2524], labels=['1/Year', '1/day'])
+    _ = plt.xlabel('Frequency (log scale)')
+    plt.show()
+
+    # wykonanie podziału danych na 70%, 20%, 10% dla zestawów treningowych, walidacyjnych i testowych
+
+    del data_to_train['Date Time']
+    n = len(data_to_train)
+    train_df = data_to_train[0:int(n * 0.7)]
+    val_df = data_to_train[int(n * 0.7):int(n * 0.9)]
+    test_df = data_to_train[int(n * 0.9):]
+
+    num_features = data_to_train.shape[1]
+
+    # Ważne jest, aby skalować funkcje przed uczeniem sieci neuronowej. Normalizacja jest powszechnym sposobem wykonywania tego skalowania: odejmij średnią i podziel przez odchylenie #standardowe każdej cechy.
+    train_mean = train_df.mean()
+    train_std = train_df.std()
+
+    train_df = (train_df - train_mean) / train_std
+    val_df = (val_df - train_mean) / train_std
+    test_df = (test_df - train_mean) / train_std
+
+    df_std = (data_to_train - train_mean) / train_std
+    df_std = df_std.melt(var_name='Column', value_name='Normalized')
+    plt.figure(figsize=(12, 6))
+    ax = sns.violinplot(x='Column', y='Normalized', data=df_std)
+    _ = ax.set_xticklabels(data_to_train.keys(), rotation=90)
+    plt.show()
+
+    w1 = wg.StoreModelData(input_width=24, label_width=1, shift=24, train_df=train_df, val_df=val_df, test_df=test_df,
+                           label_columns=['T (degC)'])
+    dense = tf.keras.Sequential([
+        tf.keras.layers.Dense(units=64, activation='relu'),
+        tf.keras.layers.Dense(units=64, activation='relu'),
+        tf.keras.layers.Dense(units=1)
+    ])
 
 
 if __name__ == '__main__':

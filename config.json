@@ -1,3 +1,4 @@
 {
-  "amountOfHeadRows" : 15
+  "amountOfHeadRows" : 15,
+  "saveFig" : true
 }
