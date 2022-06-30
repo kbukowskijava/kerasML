@@ -1,4 +1,5 @@
 {
   "amountOfHeadRows" : 15,
-  "saveFig" : true
+  "saveFig" : true,
+  "modelPath" : "weather.model"
 }
